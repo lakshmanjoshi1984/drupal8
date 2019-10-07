@@ -1,0 +1,19 @@
+services:
+  conditional_fields.route_subscriber:
+    class: Drupal\conditional_fields\Routing\RouteSubscriber
+    arguments: ['@entity.manager']
+    tags:
+      - { name: event_subscriber }
+  conditional_fields.route_enhancer:
+    class: Drupal\conditional_fields\Routing\RouteEnhancer
+    arguments: ['@entity.manager']
+    tags:
+      - { name: route_enhancer }
+  conditional_fields.conditions:
+    class: Drupal\conditional_fields\Conditions
+  plugin.manager.conditional_fields_handlers:
+    class: Drupal\conditional_fields\ConditionalFieldsHandlersManager
+    parent: default_plugin_manager
+  conditional_fields.controller:
+    class: Drupal\conditional_fields\Controller\ConditionalFieldController
+    arguments: ['@entity_type.manager', '@form_builder', '@entity_type.bundle.info', '@entity_field.manager']

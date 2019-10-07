@@ -1,0 +1,759 @@
+diff --git a/conditional_fields.links.task.yml b/conditional_fields.links.task.yml
+index 71542ff..deebad8 100644
+--- a/conditional_fields.links.task.yml
++++ b/conditional_fields.links.task.yml
+@@ -1,5 +1,3 @@
+-conditional_fields.conditional_fields:
+-  title: Manage Dependencies
+-  route_name: conditional_fields.tab
+-  base_route: entity.node_type.edit_form
+-  weight: 10
++conditional_fields.config:
++  class: \Drupal\Core\Menu\LocalTaskDefault
++  deriver: \Drupal\conditional_fields\Plugin\Derivative\ConditionalFieldsConfigTask
+diff --git a/conditional_fields.module b/conditional_fields.module
+index 3b4ba7f..2af10dd 100644
+--- a/conditional_fields.module
++++ b/conditional_fields.module
+@@ -7,6 +7,8 @@
+ 
+ use Drupal\Core\Form\FormStateInterface;
+ use Drupal\Core\Routing\RouteMatchInterface;
++use Drupal\Core\Config\Entity\ConfigEntityType;
++use Drupal\Core\Entity\ContentEntityType;
+ use Drupal\Core\Entity\EntityInterface;
+ use Drupal\Core\Field\FieldDefinitionInterface;
+ use Drupal\Core\Field\WidgetInterface;
+@@ -125,16 +127,61 @@ function conditional_fields_theme() {
+  */
+ function conditional_fields_entity_operation(EntityInterface $entity) {
+   $operations = [];
+-  if ($entity->getEntityTypeId() == 'node_type') {
++  $entity_type_id = $entity->getEntityTypeId();
++  if ($entity->hasLinkTemplate('conditional-fields') &&
++      \Drupal::currentUser()->hasPermission('view ' . $entity_type_id . ' conditional fields')) {
++
+     $operations['dependencies'] = [
+       'title' => t('Dependencies'),
+-      'url' => Url::fromRoute('conditional_fields.tab', [$entity->getEntityTypeId() => $entity->id()]),
++      'url' => Url::fromRoute("entity.{$entity_type_id}.conditionals", [$entity_type_id => $entity->id()]),
+       'weight' => 29,
+     ];
+   }
++
+   return $operations;
+ }
+ 
++/**
++ * Implements hook_entity_type_alter().
++ *
++ * Adds the Conditional Fields tab to the entity configuration page.
++ */
++function conditional_fields_entity_type_alter(array &$entity_types) {
++  $module_handler = \Drupal::moduleHandler();
++  // @var $entity_types \Drupal\Core\Entity\EntityTypeInterface[].
++  foreach ($entity_types as $entity_type) {
++    $core_entity = FALSE;
++    $module_name = $entity_type->getProvider();
++    if ($module_name != 'core') {
++      // Identify core entity types that are provided by modules.
++      $module = $module_handler->getModule($module_name);
++      if (preg_match('/^core/', $module->getPath())) {
++        $core_entity = TRUE;
++      }
++    }
++    else {
++      // Some core entity types are not provided by a module.
++      $core_entity = TRUE;
++    }
++    if ($entity_type instanceof ConfigEntityType && $entity_type->hasLinkTemplate('edit-form')) {
++      $entity_type->setLinkTemplate('conditional-fields', $entity_type->getLinkTemplate('edit-form') . '/conditionals');
++    }
++    // Also enable for Core's fieldable ContentEntityTypes without bundles.
++    // Currently can't be solved generically as Routing table isn't available
++    // at this point, see #2924075.
++    if ($core_entity && $entity_type instanceof ContentEntityType && !empty($entity_type->get('field_ui_base_route')) && empty($entity_type->getBundleEntityType())) {
++      switch ($entity_type->id()) {
++        case 'aggregator_feed':
++          $entity_type->setLinkTemplate('conditional-fields', '/admin/config/services/aggregator/conditionals');
++          break;
++        case 'user':
++          $entity_type->setLinkTemplate('conditional-fields', '/admin/config/people/accounts/conditionals');
++          break;
++      }
++    }
++  }
++}
++
+ /**
+  * Implements hook_element_info_alter().
+  *
+diff --git a/conditional_fields.permissions.yml b/conditional_fields.permissions.yml
+index 6eb4b31..81290de 100644
+--- a/conditional_fields.permissions.yml
++++ b/conditional_fields.permissions.yml
+@@ -1,5 +1,5 @@
+-view conditional fields:
+-  title: 'View Conditional fields'
++permission_callbacks:
++  - Drupal\conditional_fields\ConditionalFieldsPermissionController::conditionalFieldsPermissions
+ 
+ edit conditional fields:
+   title: 'Edit Conditional fields'
+diff --git a/conditional_fields.routing.yml b/conditional_fields.routing.yml
+index 04b84c8..0e287da 100644
+--- a/conditional_fields.routing.yml
++++ b/conditional_fields.routing.yml
+@@ -37,14 +37,6 @@ conditional_fields.delete_form:
+   requirements:
+     _permission: 'delete conditional fields'
+ 
+-conditional_fields.tab:
+-  path: '/admin/structure/types/manage/{node_type}/conditionals'
+-  defaults:
+-    _title: 'Manage Dependencies'
+-    _controller: 'conditional_fields.controller:provideArguments'
+-  requirements:
+-    _permission: 'view conditional fields'
+-
+ conditional_fields.edit_form.tab:
+   path: '/admin/structure/conditional_fields/{entity_type}/{bundle}/{field_name}/{uuid}/tab/edit'
+   defaults:
+diff --git a/conditional_fields.services.yml b/conditional_fields.services.yml
+index 2e59efe..6ac3ed8 100644
+--- a/conditional_fields.services.yml
++++ b/conditional_fields.services.yml
+@@ -1,4 +1,14 @@
+ services:
++  conditional_fields.route_subscriber:
++    class: Drupal\conditional_fields\Routing\RouteSubscriber
++    arguments: ['@entity.manager']
++    tags:
++      - { name: event_subscriber }
++  conditional_fields.route_enhancer:
++    class: Drupal\conditional_fields\Routing\RouteEnhancer
++    arguments: ['@entity.manager']
++    tags:
++      - { name: route_enhancer }
+   conditional_fields.conditions:
+     class: Drupal\conditional_fields\Conditions
+   plugin.manager.conditional_fields_handlers:
+diff --git a/js/conditional_fields.js b/js/conditional_fields.js
+index e5d297c..8316ce3 100644
+--- a/js/conditional_fields.js
++++ b/js/conditional_fields.js
+@@ -124,6 +124,27 @@ $(document).bind('state:visible-fade', function(e) {
+     }
+   }
+ })
++// Fix core's required handling.
++.bind('state:required', function (e) {
++  if (e.trigger) {
++    var fields = $(e.target).find('input, select, textarea');
++    fields.each(function() {
++      var label = 'label' + (this.id ? '[for=' + this.id + ']' : '');
++      var $label = $(e.target).find(label);
++      if (e.value) {
++        $(this).attr({ required: 'required', 'aria-required': 'aria-required' });
++        $label.each(function() {
++          $(this).addClass('js-form-required form-required');
++        });
++      } else {
++        $(this).removeAttr('required aria-required');
++        $label.each(function() {
++          $(this).removeClass('js-form-required form-required');
++        });
++      }
++    })
++  }
++})
+ // Unchanged state. Do nothing.
+ .bind('state:unchanged', function() {});
+ 
+diff --git a/src/ConditionalFieldsPermissionController.php b/src/ConditionalFieldsPermissionController.php
+new file mode 100644
+index 0000000..1601392
+--- /dev/null
++++ b/src/ConditionalFieldsPermissionController.php
+@@ -0,0 +1,63 @@
++<?php
++
++namespace Drupal\conditional_fields;
++
++use Drupal\Core\DependencyInjection\ContainerInjectionInterface;
++use Drupal\Core\Entity\EntityTypeManagerInterface;
++use Drupal\Core\StringTranslation\StringTranslationTrait;
++use Symfony\Component\DependencyInjection\ContainerInterface;
++
++/**
++ * Provides dynamic permissions of the auto_entitylabel module.
++ */
++class ConditionalFieldsPermissionController implements ContainerInjectionInterface {
++
++  use StringTranslationTrait;
++
++  /**
++   * The entity manager.
++   *
++   * @var \Drupal\Core\Entity\EntityTypeManagerInterface
++   */
++  protected $entityManager;
++
++  /**
++   * Constructs a new ConditionalFieldsPermissionController instance.
++   *
++   * @param \Drupal\Core\Entity\EntityTypeManagerInterface $entity_manager
++   *   The entity manager.
++   */
++  public function __construct(EntityTypeManagerInterface $entity_manager) {
++    $this->entityManager = $entity_manager;
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public static function create(ContainerInterface $container) {
++    return new static($container->get('entity.manager'));
++  }
++
++  /**
++   * Returns an array of conditional_fields permissions.
++   *
++   * @return array
++   *   Array with permissions.
++   */
++  public function conditionalFieldsPermissions() {
++    $permissions = [];
++
++    foreach ($this->entityManager->getDefinitions() as $entity_type_id => $entity_type) {
++      // Create a permission for each entity type to manage the entity
++      // labels.
++      if ($entity_type->hasLinkTemplate('conditional-fields') && $entity_type->hasKey('label')) {
++        $permissions['view ' . $entity_type_id . ' conditional fields'] = [
++          'title' => $this->t('%entity_label: View conditional fields', ['%entity_label' => $entity_type->getLabel()]),
++          'restrict access' => TRUE,
++        ];
++      }
++    }
++    return $permissions;
++  }
++
++}
+diff --git a/src/Controller/ConditionalFieldController.php b/src/Controller/ConditionalFieldController.php
+index eafa92f..54cc0ed 100644
+--- a/src/Controller/ConditionalFieldController.php
++++ b/src/Controller/ConditionalFieldController.php
+@@ -2,7 +2,6 @@
+ 
+ namespace Drupal\conditional_fields\Controller;
+ 
+-use Drupal\conditional_fields\Form\ConditionalFieldFormTab;
+ use Drupal\Core\Controller\ControllerBase;
+ use Drupal\Core\Entity\ContentEntityType;
+ use Drupal\Core\Entity\ContentEntityTypeInterface;
+@@ -185,18 +184,4 @@ class ConditionalFieldController extends ControllerBase {
+ 
+     return $entityTypes;
+   }
+-
+-  /**
+-   * Provide arguments for ConditionalFieldFormTab.
+-   *
+-   * @param string $node_type
+-   *   Node type.
+-   *
+-   * @return array
+-   *   Form array.
+-   */
+-  public function provideArguments($node_type) {
+-    return $this->formBuilder->getForm(ConditionalFieldFormTab::class, 'node', $node_type);
+-  }
+-
+ }
+diff --git a/src/Form/ConditionalFieldDeleteForm.php b/src/Form/ConditionalFieldDeleteForm.php
+index 124ba82..3bca412 100644
+--- a/src/Form/ConditionalFieldDeleteForm.php
++++ b/src/Form/ConditionalFieldDeleteForm.php
+@@ -2,9 +2,11 @@
+ 
+ namespace Drupal\conditional_fields\Form;
+ 
++use Drupal\Core\Entity\EntityTypeManager;
+ use Drupal\Core\Form\FormStateInterface;
+ use Drupal\Core\Form\ConfirmFormBase;
+ use Drupal\Core\Url;
++use Symfony\Component\DependencyInjection\ContainerInterface;
+ 
+ /**
+  * Class ConditionalFieldDeleteForm.
+@@ -13,11 +15,34 @@ use Drupal\Core\Url;
+  */
+ class ConditionalFieldDeleteForm extends ConfirmFormBase {
+ 
+-  private $entityType;
++  protected $entityType;
+   private $bundle;
+   private $fieldName;
+   private $uuid;
+ 
++  /**
++   * @var \Drupal\Core\Entity\EntityTypeManager
++   */
++  protected $entityTypeManager;
++
++
++  /**
++   * ConditionalFieldDeleteForm constructor.
++   *
++   * @param \Drupal\Core\Entity\EntityTypeManager $entityTypeManager
++   */
++  public function __construct(EntityTypeManager $entityTypeManager)
++  {
++    $this->entityTypeManager = $entityTypeManager;
++  }
++
++  public static function create(ContainerInterface $container)
++  {
++    return new static(
++      $container->get('entity_type.manager')
++    );
++  }
++
+   /**
+    * {@inheritdoc}
+    */
+diff --git a/src/Form/ConditionalFieldDeleteFormTab.php b/src/Form/ConditionalFieldDeleteFormTab.php
+index 0027223..44d5e49 100644
+--- a/src/Form/ConditionalFieldDeleteFormTab.php
++++ b/src/Form/ConditionalFieldDeleteFormTab.php
+@@ -14,13 +14,19 @@ class ConditionalFieldDeleteFormTab extends ConditionalFieldDeleteForm {
+ 
+   protected $bundle;
+ 
++  protected $entity_type;
++
+   /**
+    * {@inheritdoc}
+    */
+   public function getCancelUrl() {
+-    return Url::fromRoute('conditional_fields.tab', [
+-      'node_type' => $this->bundle,
+-    ]);
++    $bundle = $this->bundle;
++    $entity_type = $this->entity_type;
++    if ($bundle_type = $this->entityTypeManager->getDefinition($entity_type)->getBundleEntityType()) {
++      $entity_type = $bundle_type;
++    }
++
++    return Url::fromRoute("entity.$entity_type.conditionals", [$entity_type => $bundle]);
+   }
+ 
+   /**
+@@ -34,6 +40,7 @@ class ConditionalFieldDeleteFormTab extends ConditionalFieldDeleteForm {
+    * {@inheritdoc}
+    */
+   public function buildForm(array $form, FormStateInterface $form_state, $entity_type = NULL, $bundle = NULL, $field_name = NULL, $uuid = NULL) {
++    $this->entity_type = $entity_type;
+     $this->bundle = $bundle;
+     return parent::buildForm($form, $form_state, $entity_type, $bundle, $field_name, $uuid);
+   }
+diff --git a/src/Form/ConditionalFieldEditForm.php b/src/Form/ConditionalFieldEditForm.php
+index 9744115..4be34f0 100644
+--- a/src/Form/ConditionalFieldEditForm.php
++++ b/src/Form/ConditionalFieldEditForm.php
+@@ -348,13 +348,17 @@ class ConditionalFieldEditForm extends FormBase {
+     }
+     $entity->save();
+ 
++    $entity_type = $values['entity_type'];
++    if ($bundle_type = $this->entityTypeManager->getDefinition($entity_type)->getBundleEntityType()) {
++      $entity_type = $bundle_type;
++    }
++
+     $parameters = [
+-      'entity_type' => $values['entity_type'],
++      'entity_type' => $entity_type,
+       'bundle' => $values['bundle'],
+     ];
+ 
+     $form_state->setRedirect($this->redirectPath, $parameters);
+-
+   }
+ 
+   /**
+diff --git a/src/Form/ConditionalFieldEditFormTab.php b/src/Form/ConditionalFieldEditFormTab.php
+index bc73643..6ad76a1 100644
+--- a/src/Form/ConditionalFieldEditFormTab.php
++++ b/src/Form/ConditionalFieldEditFormTab.php
+@@ -11,8 +11,6 @@ use Drupal\Core\Form\FormStateInterface;
+  */
+ class ConditionalFieldEditFormTab extends ConditionalFieldEditForm {
+ 
+-  protected $redirectPath = 'conditional_fields.tab';
+-
+   /**
+    * {@inheritdoc}
+    */
+@@ -26,10 +24,13 @@ class ConditionalFieldEditFormTab extends ConditionalFieldEditForm {
+   public function submitForm(array &$form, FormStateInterface $form_state) {
+     parent::submitForm($form, $form_state);
+     $values = $form_state->cleanValues()->getValues();
+-    $parameters = ['node_type' => $values['bundle']];
+ 
+-    $form_state->setRedirect($this->redirectPath, $parameters);
++    $entity_type = $values['entity_type'];
++    if ($bundle_type = $this->entityTypeManager->getDefinition($entity_type)->getBundleEntityType()) {
++      $entity_type = $bundle_type;
++    }
+ 
++    $form_state->setRedirect("entity.$entity_type.conditionals", [$entity_type => $values['bundle']]);
+   }
+ 
+ }
+diff --git a/src/Form/ConditionalFieldForm.php b/src/Form/ConditionalFieldForm.php
+index b6f9c6b..6f8d8bb 100644
+--- a/src/Form/ConditionalFieldForm.php
++++ b/src/Form/ConditionalFieldForm.php
+@@ -5,6 +5,7 @@ namespace Drupal\conditional_fields\Form;
+ use Drupal\Component\Uuid\UuidInterface;
+ use Drupal\Core\Form\FormBase;
+ use Drupal\Core\Form\FormStateInterface;
++use Drupal\Core\Routing\RouteMatchInterface;
+ use Drupal\Core\Url;
+ use Drupal\conditional_fields\Conditions;
+ use Symfony\Component\DependencyInjection\ContainerInterface;
+@@ -22,6 +23,13 @@ class ConditionalFieldForm extends FormBase {
+ 
+   protected $deletePath = 'conditional_fields.delete_form';
+ 
++  /**
++   * An interface for classes representing the result of routing.
++   *
++   * @var \Drupal\Core\Routing\RouteMatchInterface
++   */
++  protected $routeMatch;
++
+   /**
+    * Uuid generator.
+    *
+@@ -50,11 +58,34 @@ class ConditionalFieldForm extends FormBase {
+    */
+   protected $list;
+ 
++  /**
++   * The machine name of the entity type this form is for.
++   *
++   * @var string
++   */
++  protected $entityType;
++
++  /**
++   * The machine name of the bundle this form is for.
++   *
++   * @var string
++   */
++  protected $entityBundle;
++
++  /**
++   * The entity type that our config entity describes bundles of.
++   *
++   * @var string
++   */
++  protected $entityTypeBundleOf;
++
+   /**
+    * Class constructor.
+    *
+    * @param \Drupal\conditional_fields\Conditions $list
+    *   Conditions list provider.
++   * @param \Drupal\Core\Routing\RouteMatchInterface $routeMatch
++   *   Conditions list provider.
+    * @param \Drupal\Core\Entity\EntityFieldManagerInterface $entity_field_manager
+    *   Provides an interface for an entity field manager.
+    * @param \Drupal\Core\Entity\EntityTypeManagerInterface $entity_type_manager
+@@ -62,11 +93,25 @@ class ConditionalFieldForm extends FormBase {
+    * @param \Drupal\Component\Uuid\UuidInterface $uuid
+    *   Uuid generator.
+    */
+-  public function __construct(Conditions $list, EntityFieldManagerInterface $entity_field_manager, EntityTypeManagerInterface $entity_type_manager, UuidInterface $uuid) {
++  public function __construct(Conditions $list, RouteMatchInterface $routeMatch, EntityFieldManagerInterface $entity_field_manager, EntityTypeManagerInterface $entity_type_manager, UuidInterface $uuid) {
++    $this->list = $list;
++    $this->routeMatch = $routeMatch;
+     $this->entityFieldManager = $entity_field_manager;
+     $this->entityTypeManager = $entity_type_manager;
+-    $this->list = $list;
+     $this->uuidGenerator = $uuid;
++
++    $route_options = $this->routeMatch->getRouteObject()->getOptions();
++    $array_keys = array_keys($route_options['parameters']);
++    $this->entityType = array_shift($array_keys);
++    $entity_type = $this->routeMatch->getParameter($this->entityType);
++    if (!empty($entity_type)) {
++      $this->entityBundle = $entity_type->id();
++      $this->entityTypeBundleOf = $entity_type->getEntityType()->getBundleOf();
++    }
++    else {
++      $this->entityBundle = $this->entityType;
++      $this->entityTypeBundleOf = $this->entityType;
++    }
+   }
+ 
+   /**
+@@ -77,6 +122,7 @@ class ConditionalFieldForm extends FormBase {
+     return new static(
+     // Load the service required to construct this class.
+       $container->get('conditional_fields.conditions'),
++      $container->get('current_route_match'),
+       $container->get('entity_field.manager'),
+       $container->get('entity_type.manager'),
+       $container->get('uuid')
+@@ -95,11 +141,13 @@ class ConditionalFieldForm extends FormBase {
+    */
+   public function buildForm(array $form, FormStateInterface $form_state, $entity_type = NULL, $bundle = NULL) {
+ 
++    $entity_type = $entity_type ?? $this->entityTypeBundleOf;
+     $form['entity_type'] = [
+       '#type' => 'hidden',
+       '#value' => $entity_type,
+     ];
+ 
++    $bundle = $bundle ?? $this->entityBundle;
+     $form['bundle'] = [
+       '#type' => 'hidden',
+       '#value' => $bundle,
+diff --git a/src/Plugin/Derivative/ConditionalFieldsConfigTask.php b/src/Plugin/Derivative/ConditionalFieldsConfigTask.php
+new file mode 100644
+index 0000000..a1876b2
+--- /dev/null
++++ b/src/Plugin/Derivative/ConditionalFieldsConfigTask.php
+@@ -0,0 +1,74 @@
++<?php
++
++namespace Drupal\conditional_fields\Plugin\Derivative;
++
++use Drupal\Component\Plugin\Derivative\DeriverBase;
++use Drupal\Core\Entity\ContentEntityType;
++use Drupal\Core\Entity\EntityTypeManagerInterface;
++use Drupal\Core\Plugin\Discovery\ContainerDeriverInterface;
++use Drupal\Core\StringTranslation\StringTranslationTrait;
++use Symfony\Component\DependencyInjection\ContainerInterface;
++
++/**
++ * Class for Config Task.
++ */
++class ConditionalFieldsConfigTask extends DeriverBase implements ContainerDeriverInterface {
++  use StringTranslationTrait;
++
++  /**
++   * The entity manager.
++   *
++   * @var \Drupal\Core\Entity\EntityTypeManagerInterface
++   */
++  protected $entityManager;
++
++  /**
++   * Creates an FieldUiLocalTask object.
++   *
++   * @param \Drupal\Core\Entity\EntityTypeManagerInterface $entity_manager
++   *   The entity manager.
++   */
++  public function __construct(EntityTypeManagerInterface $entity_manager) {
++    $this->entityManager = $entity_manager;
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public static function create(ContainerInterface $container, $base_plugin_id) {
++    return new static(
++      $container->get('entity.manager')
++    );
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function getDerivativeDefinitions($base_plugin_definition) {
++    $this->derivatives = [];
++
++    foreach ($this->entityManager->getDefinitions() as $entity_type_id => $entity_type) {
++      if ($entity_type instanceof ContentEntityType) {
++        $base_route = $entity_type->get("field_ui_base_route");
++      }
++      else {
++        // Special handling of Taxonomy. See https://www.drupal.org/node/2822546
++        $base_route = $entity_type_id == "taxonomy_vocabulary" ? "entity.taxonomy_vocabulary.overview_form" : "entity.{$entity_type_id}.edit_form";
++      }
++      if ($entity_type->hasLinkTemplate('conditional-fields')) {
++        $this->derivatives["$entity_type_id.conditional_fields_tab"] = [
++          'route_name' => "entity.{$entity_type_id}.conditionals",
++          'title' => $this->t('Manage dependencies'),
++          'base_route' => $base_route,
++          'weight' => 10,
++        ];
++      }
++    }
++
++    foreach ($this->derivatives as &$entry) {
++      $entry += $base_plugin_definition;
++    }
++    return $this->derivatives;
++  }
++
++}
+diff --git a/src/Routing/RouteEnhancer.php b/src/Routing/RouteEnhancer.php
+new file mode 100644
+index 0000000..5d4046e
+--- /dev/null
++++ b/src/Routing/RouteEnhancer.php
+@@ -0,0 +1,61 @@
++<?php
++
++namespace Drupal\conditional_fields\Routing;
++
++use Drupal\Core\Entity\EntityTypeManagerInterface;
++use Drupal\Core\Routing\Enhancer\RouteEnhancerInterface;
++use Symfony\Cmf\Component\Routing\RouteObjectInterface;
++use Symfony\Component\HttpFoundation\Request;
++use Symfony\Component\Routing\Route;
++
++/**
++ * RouteEnhancer Class.
++ *
++ * Enhances Conditional Fields routes by adding proper information about the
++ * bundle name.
++ */
++class RouteEnhancer implements RouteEnhancerInterface {
++
++  /**
++   * The entity manager.
++   *
++   * @var \Drupal\Core\Entity\EntityTypeManagerInterface
++   */
++  protected $entityManager;
++
++  /**
++   * Constructs a RouteEnhancer object.
++   *
++   * @param \Drupal\Core\Entity\EntityTypeManagerInterface $entity_manager
++   *   The entity manager.
++   */
++  public function __construct(EntityTypeManagerInterface $entity_manager) {
++    $this->entityManager = $entity_manager;
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function enhance(array $defaults, Request $request) {
++    if (!$this->applies($defaults[RouteObjectInterface::ROUTE_OBJECT])) {
++      return $defaults;
++    }
++
++    if (($bundle = $this->entityManager->getDefinition($defaults['entity_type_id'])->getBundleEntityType()) && isset($defaults[$bundle])) {
++      // Conditional Fields forms only need the actual name of the bundle
++      // they're dealing with, not an upcasted entity object, so provide a
++      // simple way for them to get it.
++      $defaults['bundle'] = $defaults['_raw_variables']->get($bundle);
++    }
++
++    return $defaults;
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function applies(Route $route) {
++    return ($route->hasOption('conditionals'));
++  }
++
++}
+diff --git a/src/Routing/RouteSubscriber.php b/src/Routing/RouteSubscriber.php
+new file mode 100644
+index 0000000..f62a4dc
+--- /dev/null
++++ b/src/Routing/RouteSubscriber.php
+@@ -0,0 +1,83 @@
++<?php
++
++namespace Drupal\conditional_fields\Routing;
++
++use Drupal\Core\Entity\EntityTypeInterface;
++use Drupal\Core\Entity\EntityTypeManagerInterface;
++use Drupal\Core\Routing\RouteSubscriberBase;
++use Drupal\Core\Routing\RoutingEvents;
++use Symfony\Component\Routing\Route;
++use Symfony\Component\Routing\RouteCollection;
++
++/**
++ * Subscriber for conditional_fields routes.
++ */
++class RouteSubscriber extends RouteSubscriberBase {
++
++  /**
++   * The entity type manager.
++   *
++   * @var \Drupal\Core\Entity\EntityTypeManagerInterface
++   */
++  protected $entityTypeManager;
++
++  /**
++   * Constructs a new RouteSubscriber object.
++   *
++   * @param \Drupal\Core\Entity\EntityTypeManagerInterface $entity_manager
++   *   The entity type manager.
++   */
++  public function __construct(EntityTypeManagerInterface $entity_manager) {
++    $this->entityTypeManager = $entity_manager;
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  protected function alterRoutes(RouteCollection $collection) {
++    foreach ($this->entityTypeManager->getDefinitions() as $entity_type_id => $entity_type) {
++      if ($route = $this->getConditionalFieldsRoute($entity_type)) {
++        $collection->add("entity.$entity_type_id.conditionals", $route);
++      }
++    }
++  }
++
++  /**
++   * Gets the Entity Conditional Fields route.
++   *
++   * @param \Drupal\Core\Entity\EntityTypeInterface $entity_type
++   *   The entity type.
++   *
++   * @return \Symfony\Component\Routing\Route|null
++   *   The generated route, if available.
++   */
++  protected function getConditionalFieldsRoute(EntityTypeInterface $entity_type) {
++    if ($route_load = $entity_type->getLinkTemplate('conditional-fields')) {
++      $entity_type_id = $entity_type->id();
++      $route = new Route($route_load);
++      $route
++      ->addDefaults([
++          '_form' => '\Drupal\conditional_fields\Form\ConditionalFieldFormTab',
++          '_title' => 'Manage Dependencies',
++      ])
++      ->addRequirements([
++          '_permission' => 'view ' . $entity_type_id . ' conditional fields',
++      ])
++      ->setOption('_admin_route', TRUE)
++      ->setOption('parameters', [
++          $entity_type_id => ['type' => 'entity:' . $entity_type_id],
++      ]);
++      return $route;
++    }
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public static function getSubscribedEvents() {
++    $events = parent::getSubscribedEvents();
++    $events[RoutingEvents::ALTER] = ['onAlterRoutes', -100];
++    return $events;
++  }
++
++}

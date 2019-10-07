@@ -1,0 +1,176 @@
+diff --git a/core/misc/states.es6.js b/core/misc/states.es6.js
+index 811a5112d1..68feb44270 100644
+--- a/core/misc/states.es6.js
++++ b/core/misc/states.es6.js
+@@ -138,6 +138,8 @@
+     Object.keys(this.dependees || {}).forEach(selector => {
+       this.initializeDependee(selector, this.dependees[selector]);
+     });
++    // Reevaluate to execute initial states.
++    this.reevaluate();
+   };
+ 
+   /**
+@@ -201,12 +203,18 @@
+         this.values[selector][state.name] = null;
+ 
+         // Monitor state changes of the specified state for this dependee.
+-        $(selector).on(`state:${state}`, { selector, state }, e => {
++        let $dependee = $(selector);
++        $dependee.on(`state:${state}`, { selector, state }, e => {
+           this.update(e.data.selector, e.data.state, e.value);
+         });
+ 
+         // Make sure the event we just bound ourselves to is actually fired.
+         new states.Trigger({ selector, state });
++
++        // Update initial state value, if set by data attribute.
++        if ($dependee.data(`trigger:${state.name}`) !== undefined) {
++          this.values[selector][state.name] = $dependee.data(`trigger:${state.name}`);
++        }
+       });
+     },
+ 
+@@ -437,7 +445,7 @@
+ 
+       // Only call the trigger initializer when it wasn't yet attached to this
+       // element. Otherwise we'd end up with duplicate events.
+-      if (!this.element.data(`trigger:${this.state}`)) {
++      if (this.element.data(`trigger:${this.state}`) === undefined) {
+         this.initialize();
+       }
+     }
+@@ -452,15 +460,16 @@
+ 
+       if (typeof trigger === 'function') {
+         // We have a custom trigger initialization function.
++        // Create data attribute for trigger, to prevent multiple
++        // calls to this method.
++        this.element.data('trigger:' + this.state, null);
++        // Call custom trigger initialization function.
+         trigger.call(window, this.element);
+       } else {
+         Object.keys(trigger || {}).forEach(event => {
+           this.defaultTrigger(event, trigger[event]);
+         });
+       }
+-
+-      // Mark this trigger as initialized for this element.
+-      this.element.data(`trigger:${this.state}`, true);
+     },
+ 
+     /**
+@@ -474,6 +483,9 @@
+     defaultTrigger(event, valueFn) {
+       let oldValue = valueFn.call(this.element);
+ 
++      // Save current value to element data attribute.
++      this.element.data('trigger:' + this.state, oldValue);
++
+       // Attach the event callback.
+       this.element.on(
+         event,
+@@ -487,20 +499,11 @@
+               oldValue,
+             });
+             oldValue = value;
++            // Save current value to element data attribute.
++            this.element.data('trigger:' + this.state, value);
+           }
+         }, this),
+       );
+-
+-      states.postponed.push(
+-        $.proxy(function() {
+-          // Trigger the event once for initialization purposes.
+-          this.element.trigger({
+-            type: `state:${this.state}`,
+-            value: oldValue,
+-            oldValue: null,
+-          });
+-        }, this),
+-      );
+     },
+   };
+ 
+diff --git a/core/misc/states.js b/core/misc/states.js
+index 7b451b07de..323eba6026 100644
+--- a/core/misc/states.js
++++ b/core/misc/states.js
+@@ -70,6 +70,8 @@
+     Object.keys(this.dependees || {}).forEach(function (selector) {
+       _this.initializeDependee(selector, _this.dependees[selector]);
+     });
++
++    this.reevaluate();
+   };
+ 
+   states.Dependent.comparisons = {
+@@ -101,11 +103,16 @@
+ 
+         _this2.values[selector][state.name] = null;
+ 
+-        $(selector).on('state:' + state, { selector: selector, state: state }, function (e) {
++        var $dependee = $(selector);
++        $dependee.on('state:' + state, { selector: selector, state: state }, function (e) {
+           _this2.update(e.data.selector, e.data.state, e.value);
+         });
+ 
+         new states.Trigger({ selector: selector, state: state });
++
++        if ($dependee.data('trigger:' + state.name) !== undefined) {
++          _this2.values[selector][state.name] = $dependee.data('trigger:' + state.name);
++        }
+       });
+     },
+     compare: function compare(reference, selector, state) {
+@@ -202,7 +209,7 @@
+     if (this.state in states.Trigger.states) {
+       this.element = $(this.selector);
+ 
+-      if (!this.element.data('trigger:' + this.state)) {
++      if (this.element.data('trigger:' + this.state) === undefined) {
+         this.initialize();
+       }
+     }
+@@ -215,18 +222,20 @@
+       var trigger = states.Trigger.states[this.state];
+ 
+       if (typeof trigger === 'function') {
++        this.element.data('trigger:' + this.state, null);
++
+         trigger.call(window, this.element);
+       } else {
+         Object.keys(trigger || {}).forEach(function (event) {
+           _this3.defaultTrigger(event, trigger[event]);
+         });
+       }
+-
+-      this.element.data('trigger:' + this.state, true);
+     },
+     defaultTrigger: function defaultTrigger(event, valueFn) {
+       var oldValue = valueFn.call(this.element);
+ 
++      this.element.data('trigger:' + this.state, oldValue);
++
+       this.element.on(event, $.proxy(function (e) {
+         var value = valueFn.call(this.element, e);
+ 
+@@ -237,15 +246,9 @@
+             oldValue: oldValue
+           });
+           oldValue = value;
+-        }
+-      }, this));
+ 
+-      states.postponed.push($.proxy(function () {
+-        this.element.trigger({
+-          type: 'state:' + this.state,
+-          value: oldValue,
+-          oldValue: null
+-        });
++          this.element.data('trigger:' + this.state, value);
++        }
+       }, this));
+     }
+   };

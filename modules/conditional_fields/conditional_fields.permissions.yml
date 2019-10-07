@@ -1,0 +1,8 @@
+permission_callbacks:
+  - Drupal\conditional_fields\ConditionalFieldsPermissionController::conditionalFieldsPermissions
+
+edit conditional fields:
+  title: 'Edit Conditional fields'
+
+delete conditional fields:
+  title: 'Delete Conditional fields'
